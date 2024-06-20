@@ -3,7 +3,6 @@ import type { Plugin } from '@web/dev-server-core';
 import type { PfeDevServerConfigOptions } from '../config.js';
 
 import { dirname, join } from 'node:path';
-import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 
 import { fileURLToPath } from 'node:url';
@@ -14,14 +13,11 @@ import nunjucks, { type Environment } from 'nunjucks';
 import { makeDemoEnv } from '../../environment.js';
 import { Manifest } from '../../custom-elements-manifest/lib/Manifest.js';
 import { deslugify, type PfeConfig } from '../../config.js';
+import { glob } from 'glob';
 
 type PfeDevServerInternalConfig = Required<PfeDevServerConfigOptions> & {
   site: Required<PfeConfig['site']>;
 };
-
-function isPFEManifest(x: Manifest) {
-  return x.packageJson?.name === '@patternfly/elements';
-}
 
 async function isDir(path: string) {
   try {
@@ -32,11 +28,29 @@ async function isDir(path: string) {
   }
 }
 
+async function getElementsPkgJson(config: PfeDevServerInternalConfig) {
+  let dir = config.elementsDir;
+  let pkgPath;
+  while (dir !== config.rootDir && !pkgPath) {
+    [pkgPath] = await glob('package.json', { cwd: dir, absolute: true });
+    if (!pkgPath) {
+      dir = dirname(dir);
+    }
+  }
+  try {
+    if (pkgPath) {
+      return JSON.parse(await readFile(pkgPath, 'utf8'));
+    }
+  } catch {
+    return;
+  }
+}
+
 /** cludge to ensure the dev server starts up only after the manifests are generated */
 async function getManifests(config: PfeDevServerInternalConfig) {
   let count = 0;
   let manifests = Manifest.getAll(config.rootDir);
-  while (count < 1000 && manifests.find(isPFEManifest)?.manifest === null) {
+  while (count < 1000 && manifests.length < 0) {
     await new Promise(r => setTimeout(r, 50));
     count++;
     manifests = Manifest.getAll(config.rootDir);
@@ -55,27 +69,42 @@ async function renderURL(
   const url = new URL(ctx.request.url, `http://${ctx.request.headers.host}`);
   const manifests = await getManifests(config);
   const demos = manifests
-      .flatMap(manifest =>
-        manifest
-            .getTagNames()
-            .flatMap(tagName =>
-              manifest.getDemoMetadata(tagName, config as PfeDevServerInternalConfig)));
-  const demo = demos.find(x => x.permalink === url.pathname);
-  const manifest = demo?.manifest;
+      .flatMap(manifest => manifest
+          .getTagNames()
+          .flatMap(tagName =>
+            manifest.getDemoMetadata(tagName, config as PfeDevServerInternalConfig)));
 
-  if (!manifest || !demo || !demo.filePath || !existsSync(demo.filePath)) {
-    return env.render('index.html', { context: ctx, options: config, demos });
-  } else {
-    const templateContent = await readFile(demo.filePath, 'utf8');
-    return env.render('index.html', {
+  const demo = demos.find(x => x.permalink === url.pathname);
+
+  const elementsPkgJson = await getElementsPkgJson(config);
+
+  const manifest =
+    demo?.manifest ?? manifests.find(x => x.packageJson?.name === elementsPkgJson.name);
+
+  let templateContent;
+  if (demo?.filePath) {
+    templateContent = await readFile(demo.filePath, 'utf8');
+  // TODO: parameterize, custom permalinks
+  // maybe use the first demo and double up
+  } else if (url.pathname.includes('/knobs/')) {
+    // TODO: de-urlify, see previous TODO
+    const slug = url.pathname.split('/').at(2);
+    templateContent = env.render('knobs.html', {
       context: ctx,
       options: config,
-      demo,
-      demos,
-      templateContent,
+      tagName: deslugify(slug!, config.rootDir),
       manifest,
     });
   }
+
+  return env.render('index.html', {
+    context: ctx,
+    options: config,
+    demo,
+    demos,
+    templateContent,
+    manifest,
+  });
 }
 
 /** Render the demo page whenever there's a trailing slash */
